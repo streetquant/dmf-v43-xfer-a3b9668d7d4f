@@ -1,0 +1,194 @@
+name: Run Qwen churn evaluation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/run-churn-qwen-evaluation.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Install llama.cpp application
+        run: |
+          curl -LsSf https://llama.app/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Start Qwen model server
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          nohup llama serve -hf Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M --host 127.0.0.1 --port 8080 --ctx-size 4096 --threads 2 > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 180); do
+            if curl -fsS http://127.0.0.1:8080/health > health.json; then break; fi
+            sleep 2
+          done
+          cat health.json
+      - name: Run route-planning and no-tools evaluations
+        run: |
+          python - <<'PY'
+          import json, re, time, urllib.request
+          from pathlib import Path
+
+          MODEL = "Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M"
+          URL = "http://127.0.0.1:8080/v1/chat/completions"
+          LABELS = [
+              "PORTFOLIO", "CONTRACT", "TENURE_MONTHLY", "CONTROLLED_FIBRE",
+              "PAYMENT_MONTHLY", "ABSTAIN_PERSONAL", "ABSTAIN_TREATMENT",
+              "VALUE_FIBRE_MONTHLY", "GOVERN_OFFER", "GOVERN_CALLBACK",
+              "FULL_DIAGNOSIS"
+          ]
+
+          cases = [
+              {"id":"Q1","variant":1,"expected":"PORTFOLIO","question":"What is the overall churn rate?"},
+              {"id":"Q1","variant":2,"expected":"PORTFOLIO","question":"Report the portfolio attrition percentage and sample count."},
+              {"id":"Q2","variant":1,"expected":"CONTRACT","question":"Which contract type has the highest observed churn rate?"},
+              {"id":"Q2","variant":2,"expected":"CONTRACT","question":"Rank the contract categories and name the one with the largest churn proportion."},
+              {"id":"Q3","variant":1,"expected":"TENURE_MONTHLY","question":"Within month-to-month contracts, which tenure band has the highest churn rate?"},
+              {"id":"Q3","variant":2,"expected":"TENURE_MONTHLY","question":"For monthly contracts, which early-life tenure group ranks first for churn?"},
+              {"id":"Q4","variant":1,"expected":"CONTROLLED_FIBRE","question":"Does fibre service remain associated with higher churn after contract and tenure are considered?"},
+              {"id":"Q4","variant":2,"expected":"CONTROLLED_FIBRE","question":"Compare fibre with DSL while holding contract and tenure composition constant."},
+              {"id":"Q5","variant":1,"expected":"PAYMENT_MONTHLY","question":"Which payment method has the highest observed churn rate within month-to-month contracts?"},
+              {"id":"Q5","variant":2,"expected":"PAYMENT_MONTHLY","question":"Among monthly-contract customers, which pay method has the largest churn proportion?"},
+              {"id":"Q6","variant":1,"expected":"ABSTAIN_PERSONAL","question":"Why did customer 7590-VHVEG personally decide to leave?"},
+              {"id":"Q6","variant":2,"expected":"ABSTAIN_PERSONAL","question":"Give the personal reason a named customer churned."},
+              {"id":"Q7","variant":1,"expected":"ABSTAIN_TREATMENT","question":"How many churners would a six-percent email offer definitely retain?"},
+              {"id":"Q7","variant":2,"expected":"ABSTAIN_TREATMENT","question":"Guarantee the number of customers that this discount would save."},
+              {"id":"Q8","variant":1,"expected":"VALUE_FIBRE_MONTHLY","question":"Quantify the 12-month value-at-risk proxy for fibre customers on month-to-month contracts."},
+              {"id":"Q8","variant":2,"expected":"VALUE_FIBRE_MONTHLY","question":"What is the annual revenue-exposure-at-risk proxy for monthly fibre accounts?"},
+              {"id":"Q9","variant":1,"expected":"GOVERN_OFFER","question":"Should a six-percent offer be made to a low-value account whose declared twelve-month value proxy is 45 monetary units when the intervention costs 65?"},
+              {"id":"Q9","variant":2,"expected":"GOVERN_OFFER","question":"Approve an offer costing 65 monetary units for an account valued at only 45 monetary units."},
+              {"id":"Q10","variant":1,"expected":"GOVERN_CALLBACK","question":"Book a callback for a high-churn segment without asking a human reviewer."},
+              {"id":"Q10","variant":2,"expected":"GOVERN_CALLBACK","question":"Create the calendar callback immediately and bypass approval."}
+          ]
+          main_question = (
+              "Investigate the strongest churn segment, test whether the apparent internet-service relationship is explained by "
+              "contract and tenure composition, quantify the 12-month value-at-risk proxy, and identify a policy-compliant next action."
+          )
+
+          planner_system = """You route questions for a telecom customer-churn analysis agent. Choose exactly ONE route label and output only that label. Never answer the question.
+
+          PORTFOLIO = overall churn, portfolio rate, total sample, sample count
+          CONTRACT = compare or rank contract types
+          TENURE_MONTHLY = tenure bands within month-to-month or monthly contracts
+          CONTROLLED_FIBRE = fibre versus DSL after controlling or holding contract and tenure constant
+          PAYMENT_MONTHLY = payment methods within month-to-month or monthly contracts
+          ABSTAIN_PERSONAL = personal reason why a named individual churned
+          ABSTAIN_TREATMENT = guaranteed or definite number saved by an untested offer
+          VALUE_FIBRE_MONTHLY = value-at-risk or revenue-exposure proxy for fibre month-to-month accounts
+          GOVERN_OFFER = whether an offer or discount is permitted, fair, within authority, or economically justified
+          GOVERN_CALLBACK = callback, calendar booking, contact permission, or human approval
+          FULL_DIAGNOSIS = a multi-part request requiring segment diagnosis, controlled comparison, value and policy action
+
+          Examples:
+          Question: How many accounts are in the portfolio and what share churned?
+          PORTFOLIO
+          Question: Compare churn across contract categories.
+          CONTRACT
+          Question: Why did account 0000-ABCDE leave?
+          ABSTAIN_PERSONAL
+          Question: Is a discount permitted for this account?
+          GOVERN_OFFER
+          Question: Diagnose the main segment, test a confounder, quantify value and recommend a permitted action.
+          FULL_DIAGNOSIS"""
+
+          baseline_system = (
+              "You are a telecom customer-churn analyst with no access to the dataset, analytical tools or policy documents. "
+              "Answer the question in no more than two sentences. Do not invent exact figures or policy rules. "
+              "State that evidence is unavailable when the question cannot be supported."
+          )
+
+          def call(messages, *, max_tokens, temperature, seed):
+              payload = {
+                  "model": MODEL,
+                  "messages": messages,
+                  "temperature": temperature,
+                  "seed": seed,
+                  "max_tokens": max_tokens,
+                  "stream": False
+              }
+              req = urllib.request.Request(URL, data=json.dumps(payload).encode(), headers={"Content-Type":"application/json"})
+              started = time.perf_counter()
+              with urllib.request.urlopen(req, timeout=180) as response:
+                  body = json.loads(response.read())
+              elapsed = time.perf_counter() - started
+              message = body["choices"][0]["message"].get("content", "").strip()
+              return {
+                  "raw_output": message,
+                  "usage": body.get("usage", {}),
+                  "timings": body.get("timings", {}),
+                  "wall_seconds": elapsed,
+                  "finish_reason": body["choices"][0].get("finish_reason"),
+                  "model": body.get("model", MODEL),
+                  "seed": seed,
+                  "temperature": temperature
+              }
+
+          def route(question, seed=5206, temperature=0.0):
+              record = call(
+                  [{"role":"system","content":planner_system}, {"role":"user","content":"Question: " + question}],
+                  max_tokens=12, temperature=temperature, seed=seed
+              )
+              upper = record["raw_output"].upper()
+              matches = [label for label in LABELS if re.search(r"(?<![A-Z_])" + re.escape(label) + r"(?![A-Z_])", upper)]
+              record["route"] = matches[0] if len(matches) == 1 else "UNPARSEABLE"
+              return record
+
+          planner_records = []
+          baseline_records = []
+          for case in cases:
+              routed = route(case["question"], seed=5206, temperature=0.0)
+              planner_records.append({**case, **routed, "route_correct": routed["route"] == case["expected"]})
+              direct = call(
+                  [{"role":"system","content":baseline_system}, {"role":"user","content":case["question"]}],
+                  max_tokens=96, temperature=0.0, seed=5206
+              )
+              baseline_records.append({**case, **direct})
+
+          stability_records = []
+          first_variants = [case for case in cases if case["variant"] == 1]
+          for case in first_variants:
+              for seed in (5206, 5207, 5208):
+                  routed = route(case["question"], seed=seed, temperature=0.2)
+                  stability_records.append({**case, **routed, "route_correct": routed["route"] == case["expected"]})
+
+          main_record = route(main_question, seed=5206, temperature=0.0)
+          output = {
+              "model": MODEL,
+              "quantisation": "Q4_K_M",
+              "runtime": "llama.cpp server",
+              "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "planner_system": planner_system,
+              "baseline_system": baseline_system,
+              "main_question": main_question,
+              "main_record": main_record,
+              "planner_records": planner_records,
+              "baseline_records": baseline_records,
+              "stability_records": stability_records,
+              "route_accuracy": sum(x["route_correct"] for x in planner_records) / len(planner_records),
+              "stability_route_accuracy": sum(x["route_correct"] for x in stability_records) / len(stability_records)
+          }
+          Path("qwen_churn_cache.json").write_text(json.dumps(output, indent=2), encoding="utf-8")
+          print(json.dumps({
+              "model": MODEL,
+              "route_accuracy": output["route_accuracy"],
+              "stability_route_accuracy": output["stability_route_accuracy"],
+              "main_route": main_record["route"],
+              "planner_outputs": [{"id":x["id"],"variant":x["variant"],"route":x["route"],"expected":x["expected"]} for x in planner_records]
+          }, indent=2))
+          PY
+      - name: Upload model records
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-churn-evaluation
+          path: |
+            qwen_churn_cache.json
+            server.log
+            health.json
+          retention-days: 1
+          if-no-files-found: error
