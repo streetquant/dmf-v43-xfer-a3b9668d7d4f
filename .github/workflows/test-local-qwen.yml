@@ -1,0 +1,51 @@
+name: Test local Qwen inference
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/test-local-qwen.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  infer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Install llama.cpp application
+        run: |
+          curl -LsSf https://llama.app/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          find "$HOME" -maxdepth 4 -type f -name 'llama*' -perm -u+x | head -30
+      - name: Start model server
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          nohup llama serve -hf Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M --host 127.0.0.1 --port 8080 --ctx-size 2048 --threads 2 > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 180); do
+            if curl -fsS http://127.0.0.1:8080/health > health.json; then break; fi
+            sleep 2
+          done
+          cat health.json
+      - name: Query model
+        run: |
+          python - <<'PY'
+          import json, urllib.request
+          payload={"model":"Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M","messages":[{"role":"system","content":"Return exactly one label: PORTFOLIO or CONTRACT."},{"role":"user","content":"Which contract type has the highest churn rate?"}],"temperature":0,"max_tokens":16}
+          req=urllib.request.Request('http://127.0.0.1:8080/v1/chat/completions',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
+          with urllib.request.urlopen(req,timeout=180) as r: out=json.loads(r.read())
+          open('qwen-test.json','w').write(json.dumps(out,indent=2))
+          print(json.dumps(out,indent=2))
+          PY
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-test
+          path: |
+            qwen-test.json
+            server.log
+            health.json
+          retention-days: 1
