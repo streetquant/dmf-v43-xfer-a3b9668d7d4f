@@ -1,0 +1,43 @@
+name: Test GitHub Models access
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/test-models.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query model endpoint
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request, urllib.error
+          candidates = ["openai/gpt-4.1-mini", "openai/gpt-4o-mini", "meta/llama-3.3-70b-instruct"]
+          result = {}
+          for model in candidates:
+              payload = json.dumps({"model": model, "messages": [{"role":"user","content":"Reply with exactly: MODEL_OK"}], "max_tokens": 20, "temperature": 0}).encode()
+              req = urllib.request.Request("https://models.github.ai/inference/chat/completions", data=payload, headers={"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}", "Content-Type":"application/json"})
+              try:
+                  with urllib.request.urlopen(req, timeout=90) as r:
+                      body = json.loads(r.read())
+                  result = {"model": model, "status": r.status, "content": body["choices"][0]["message"].get("content"), "usage": body.get("usage")}
+                  break
+              except Exception as exc:
+                  result[model] = str(exc)
+          open("model-test.json","w").write(json.dumps(result, indent=2))
+          print(json.dumps(result, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-test
+          path: model-test.json
+          retention-days: 1
