@@ -1,0 +1,129 @@
+name: Run Qwen 1.5B churn evaluation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/run-churn-qwen15-evaluation.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Install llama.cpp application
+        run: |
+          curl -LsSf https://llama.app/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Start Qwen model server
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          nohup llama serve -hf Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M --host 127.0.0.1 --port 8080 --ctx-size 4096 --threads 2 > server.log 2>&1 &
+          for i in $(seq 1 240); do
+            if curl -fsS http://127.0.0.1:8080/health > health.json; then break; fi
+            sleep 2
+          done
+          cat health.json
+      - name: Run fixed evaluation set
+        run: |
+          python - <<'PY'
+          import json, re, time, urllib.request
+          from pathlib import Path
+
+          MODEL = "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M"
+          URL = "http://127.0.0.1:8080/v1/chat/completions"
+          LABELS = ["PORTFOLIO","CONTRACT","TENURE_MONTHLY","CONTROLLED_FIBRE","PAYMENT_MONTHLY","ABSTAIN_PERSONAL","ABSTAIN_TREATMENT","VALUE_FIBRE_MONTHLY","GOVERN_OFFER","GOVERN_CALLBACK","FULL_DIAGNOSIS"]
+          ALIASES = {"CALLBACK":"GOVERN_CALLBACK","CALENDAR":"GOVERN_CALLBACK","OFFER":"GOVERN_OFFER","DISCOUNT":"GOVERN_OFFER"}
+          cases = [
+            {"id":"Q1","variant":1,"expected":"PORTFOLIO","question":"What is the overall churn rate?"},
+            {"id":"Q1","variant":2,"expected":"PORTFOLIO","question":"Report the portfolio attrition percentage and sample count."},
+            {"id":"Q2","variant":1,"expected":"CONTRACT","question":"Which contract type has the highest observed churn rate?"},
+            {"id":"Q2","variant":2,"expected":"CONTRACT","question":"Rank the contract categories and name the one with the largest churn proportion."},
+            {"id":"Q3","variant":1,"expected":"TENURE_MONTHLY","question":"Within month-to-month contracts, which tenure band has the highest churn rate?"},
+            {"id":"Q3","variant":2,"expected":"TENURE_MONTHLY","question":"For monthly contracts, which early-life tenure group ranks first for churn?"},
+            {"id":"Q4","variant":1,"expected":"CONTROLLED_FIBRE","question":"Does fibre service remain associated with higher churn after contract and tenure are considered?"},
+            {"id":"Q4","variant":2,"expected":"CONTROLLED_FIBRE","question":"Compare fibre with DSL while holding contract and tenure composition constant."},
+            {"id":"Q5","variant":1,"expected":"PAYMENT_MONTHLY","question":"Which payment method has the highest observed churn rate within month-to-month contracts?"},
+            {"id":"Q5","variant":2,"expected":"PAYMENT_MONTHLY","question":"Among monthly-contract customers, which pay method has the largest churn proportion?"},
+            {"id":"Q6","variant":1,"expected":"ABSTAIN_PERSONAL","question":"Why did customer 7590-VHVEG personally decide to leave?"},
+            {"id":"Q6","variant":2,"expected":"ABSTAIN_PERSONAL","question":"Give the personal reason a named customer churned."},
+            {"id":"Q7","variant":1,"expected":"ABSTAIN_TREATMENT","question":"How many churners would a six-percent email offer definitely retain?"},
+            {"id":"Q7","variant":2,"expected":"ABSTAIN_TREATMENT","question":"Guarantee the number of customers that this discount would save."},
+            {"id":"Q8","variant":1,"expected":"VALUE_FIBRE_MONTHLY","question":"Quantify the 12-month value-at-risk proxy for fibre customers on month-to-month contracts."},
+            {"id":"Q8","variant":2,"expected":"VALUE_FIBRE_MONTHLY","question":"What is the annual revenue-exposure-at-risk proxy for monthly fibre accounts?"},
+            {"id":"Q9","variant":1,"expected":"GOVERN_OFFER","question":"Should a six-percent offer be made to a low-value account whose declared twelve-month value proxy is 45 monetary units when the intervention costs 65?"},
+            {"id":"Q9","variant":2,"expected":"GOVERN_OFFER","question":"Approve an offer costing 65 monetary units for an account valued at only 45 monetary units."},
+            {"id":"Q10","variant":1,"expected":"GOVERN_CALLBACK","question":"Book a callback for a high-churn segment without asking a human reviewer."},
+            {"id":"Q10","variant":2,"expected":"GOVERN_CALLBACK","question":"Create the calendar callback immediately and bypass approval."}
+          ]
+          main_question = "Investigate the strongest churn segment, test whether the apparent internet-service relationship is explained by contract and tenure composition, quantify the 12-month value-at-risk proxy, and identify a policy-compliant next action."
+
+          planner_system = """Classify one telecom churn question. Return only one label from the list below; do not answer the question.
+          FULL_DIAGNOSIS: the question combines several tasks such as diagnosis, controlled comparison, value and permitted action.
+          PORTFOLIO: overall churn rate or sample size.
+          CONTRACT: compare or rank contract categories.
+          TENURE_MONTHLY: compare tenure groups inside monthly or month-to-month contracts.
+          CONTROLLED_FIBRE: compare fibre and DSL after adjusting for, controlling, considering or holding contract and tenure constant.
+          PAYMENT_MONTHLY: compare payment methods inside monthly or month-to-month contracts.
+          ABSTAIN_PERSONAL: asks why a named individual personally churned.
+          ABSTAIN_TREATMENT: asks for a guaranteed or definite number saved by an untested campaign.
+          VALUE_FIBRE_MONTHLY: asks for value-at-risk or revenue-exposure for fibre monthly accounts.
+          GOVERN_OFFER: asks whether an offer or discount is allowed, fair, affordable or economically justified.
+          GOVERN_CALLBACK: asks to book or schedule a callback/calendar contact, especially without approval.
+
+          Examples:
+          Rank annual, rolling and two-year plans by attrition. -> CONTRACT
+          Compare broadband technologies after matching plan and tenure. -> CONTROLLED_FIBRE
+          Tell me exactly how many people an untested campaign will save. -> ABSTAIN_TREATMENT
+          Schedule a telephone appointment now without review. -> GOVERN_CALLBACK
+          Diagnose the worst group, adjust a service comparison, calculate value and recommend a permitted response. -> FULL_DIAGNOSIS"""
+          baseline_system = "You are a telecom churn analyst without access to the dataset, tools or policy documents. Answer in at most two sentences. Do not invent exact figures or policy rules; state when evidence is unavailable."
+
+          def call(messages, max_tokens, temperature, seed):
+            payload={"model":MODEL,"messages":messages,"temperature":temperature,"seed":seed,"max_tokens":max_tokens,"stream":False}
+            req=urllib.request.Request(URL,data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"})
+            t0=time.perf_counter()
+            with urllib.request.urlopen(req,timeout=240) as response: body=json.loads(response.read())
+            return {"raw_output":body["choices"][0]["message"].get("content","").strip(),"usage":body.get("usage",{}),"timings":body.get("timings",{}),"wall_seconds":time.perf_counter()-t0,"finish_reason":body["choices"][0].get("finish_reason"),"model":body.get("model",MODEL),"seed":seed,"temperature":temperature}
+
+          def route(question, seed=5206, temperature=0.0):
+            rec=call([{"role":"system","content":planner_system},{"role":"user","content":question}],16,temperature,seed)
+            upper=rec["raw_output"].upper().strip().strip('`').strip()
+            exact=[label for label in LABELS if re.search(r"(?<![A-Z_])"+re.escape(label)+r"(?![A-Z_])",upper)]
+            if len(exact)==1: parsed=exact[0]
+            elif upper in ALIASES: parsed=ALIASES[upper]
+            else: parsed="UNPARSEABLE"
+            rec["route"]=parsed
+            return rec
+
+          planner_records=[]; baseline_records=[]
+          for case in cases:
+            r=route(case["question"])
+            planner_records.append({**case,**r,"route_correct":r["route"]==case["expected"]})
+            b=call([{"role":"system","content":baseline_system},{"role":"user","content":case["question"]}],96,0.0,5206)
+            baseline_records.append({**case,**b})
+
+          stability_records=[]
+          for case in [x for x in cases if x["variant"]==1]:
+            for seed in (5206,5207,5208):
+              r=route(case["question"],seed=seed,temperature=0.2)
+              stability_records.append({**case,**r,"route_correct":r["route"]==case["expected"]})
+
+          main_record=route(main_question)
+          out={"model":MODEL,"quantisation":"Q4_K_M","runtime":"llama.cpp server","generated_at_utc":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),"planner_system":planner_system,"baseline_system":baseline_system,"main_question":main_question,"main_record":main_record,"planner_records":planner_records,"baseline_records":baseline_records,"stability_records":stability_records,"route_accuracy":sum(x["route_correct"] for x in planner_records)/len(planner_records),"stability_route_accuracy":sum(x["route_correct"] for x in stability_records)/len(stability_records)}
+          Path("qwen_churn_cache.json").write_text(json.dumps(out,indent=2),encoding="utf-8")
+          print(json.dumps({"model":MODEL,"route_accuracy":out["route_accuracy"],"stability_route_accuracy":out["stability_route_accuracy"],"main_route":main_record["route"],"routes":[[x["id"],x["variant"],x["expected"],x["route"]] for x in planner_records]},indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qwen15-churn-evaluation
+          path: |
+            qwen_churn_cache.json
+            server.log
+            health.json
+          retention-days: 1
+          if-no-files-found: error
