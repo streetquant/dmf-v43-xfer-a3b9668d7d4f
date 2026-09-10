@@ -1,0 +1,28 @@
+name: Fetch Telco dataset
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fetch-telco-data.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download dataset
+        run: |
+          mkdir -p data
+          curl -L --fail --retry 5 --retry-all-errors https://raw.githubusercontent.com/IBM/telco-customer-churn-on-icp4d/master/data/Telco-Customer-Churn.csv -o data/WA_Fn-UseC_-Telco-Customer-Churn.csv
+          test "$(wc -l < data/WA_Fn-UseC_-Telco-Customer-Churn.csv)" -eq 7044
+      - name: Upload dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: telco-customer-churn-data
+          path: data/WA_Fn-UseC_-Telco-Customer-Churn.csv
+          if-no-files-found: error
+          retention-days: 1
